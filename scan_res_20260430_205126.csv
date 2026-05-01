@@ -1,0 +1,4 @@
+IP,MAC,Hostname,Vendor,Device Type,Response,Ports,Shared,Fingerprint
+192.168.1.3,Unknown,host.docker.internal,Unknown,💻 Windows PC,1ms,445,C,
+192.168.1.2,F6:92:38:7C:CC:0B,Unknown,Unknown,❓ Generic Device,17ms,-,?,
+192.168.1.1,58:BA:D4:A3:FC:8B,Unknown,Unknown,❓ Generic Device,10ms,80,❌,SSDP: Linux UPnP/1.0 Huawei-ATP-IGD

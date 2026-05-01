@@ -1,0 +1,4 @@
+profile_name,adapter,dhcp,gateway,dns1,dns2,multi_ip_masks
+10.0,Local Area Connection,False,,,,192.168.1.2;255.255.0.0
+10.254,WiFi,False,,,,192.168.2.5;255.255.0.0|192.168.0.1;255.0.0.0
+dhcp,WiFi,True,,,,192.168.1.2;255.255.255.255

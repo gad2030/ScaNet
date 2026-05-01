@@ -1,0 +1,24 @@
+[
+    [
+        "192.168.1.1",
+        "58:BA:D4:A3:FC:8B",
+        "Unknown",
+        "Unknown",
+        "\u2753 Generic Device",
+        "13ms",
+        "80",
+        "\u274c",
+        "SSDP: Linux UPnP/1.0 Huawei-ATP-IGD"
+    ],
+    [
+        "192.168.1.2",
+        "F6:92:38:7C:CC:0B",
+        "Unknown",
+        "Unknown",
+        "\u2753 Generic Device",
+        "47ms",
+        "-",
+        "?",
+        ""
+    ]
+]
