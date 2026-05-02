@@ -30,6 +30,7 @@ import queue
 import re
 from datetime import datetime
 import uuid
+import concurrent.futures
 
 
 # ------------------------------------------------------------
@@ -384,6 +385,8 @@ class LANManagerApp:
         self.my_mac = self.get_local_mac_fallback()
         self.history_path = "discovery_history.json"
         self.build_scanner_tab()
+        self._scan_filter_job = None
+        self._scan_filter_token = 0
 
     # --------------------------------------------------------
     # PROFILE TAB
@@ -597,11 +600,18 @@ class LANManagerApp:
         self.scan_status_lbl.pack(side=tk.RIGHT)
 
         # Treeview
-        cols = ("IP Address", "MAC Address", "Hostname", "Vendor", "Device Type", "Response Time", "Open Ports", "Shared")
+        cols = ("IP Address", "MAC Address", "Hostname", "Device Type", "Response Time", "Open Ports", "Shared")
         self.scanner_tree = ttk.Treeview(self.scanner_frame, columns=cols, show="headings", height=10)
         for col in cols:
             self.scanner_tree.heading(col, text=col)
-            self.scanner_tree.column(col, width=80 if "IP" in col or "Time" in col else 110)
+            if col in ("IP Address", "Response Time"):
+                self.scanner_tree.column(col, width=90)
+            elif col in ("MAC Address", "Open Ports"):
+                self.scanner_tree.column(col, width=120)
+            elif col in ("Hostname",):
+                self.scanner_tree.column(col, width=140)
+            else:
+                self.scanner_tree.column(col, width=110)
         self.scanner_tree.pack(fill=tk.BOTH, expand=True)
 
         # Right-click menu for Management Actions
@@ -686,105 +696,216 @@ class LANManagerApp:
         self.terminal.see(tk.END)
 
     def _scan_thread(self, network):
-        hosts = list(network.hosts())
-        total = len(hosts)
-        self.root.after(0, lambda: self.scan_progress.configure(maximum=total, value=0))
-        self.root.after(0, lambda: self.scan_status_lbl.config(text="Scanning..."))
-        
-        q = queue.Queue()
-        subnet_ips = set()
-        for h in hosts: 
-            q.put(str(h))
-            subnet_ips.add(str(h))
-        
-        results_found = 0
-        scanned_count = 0
-        threads = []
-        max_threads = 100
-        found_ips = set()
+        # -------------------------------
+        # Phase 1 (FAST): ARP discovery
+        # -------------------------------
+        hosts = [str(h) for h in network.hosts()]
+        total_hosts = len(hosts)
+        self.root.after(0, lambda: self.scan_progress.configure(maximum=max(total_hosts, 1), value=0))
+        self.root.after(0, lambda: self.scan_status_lbl.config(text="Discovering (ARP)..."))
 
-        def worker():
-            nonlocal results_found, scanned_count
-            while not q.empty() and not self.stop_event.is_set():
-                ip = q.get()
-                ping_time = self.ping_host(ip)
-                mac = self.get_mac_from_arp(ip)
-                
-                # Device is alive if it responds to ping OR is found in ARP table
-                if ping_time or (mac and mac != "Unknown"):
-                    host = self.resolve_hostname(ip)
-                    vendor = self.lookup_vendor(mac)
-                    ports = self.port_scan(ip) if results_found < 50 else "-"
-                    
-                    # Phase 2: Inventory Probes
-                    fingerprint = ""
-                    if results_found < 30: # Limit deep probes to keep scan fast
-                        snmp = self.snmp_probe(ip)
-                        ssdp = self.ssdp_probe(ip)
-                        if snmp: fingerprint += f"SNMP: {snmp} "
-                        if ssdp:
-                            server_match = re.search(r"Server:\s*(.*)", ssdp, re.I)
-                            if server_match: fingerprint += f"SSDP: {server_match.group(1).strip()}"
-                    
-                    if "445" in ports or "139" in ports:
-                        shared = self.get_smb_shares(ip)
-                    else:
-                        shared = "❌" if ports != "-" else "?"
-                        
-                    res_display = f"{ping_time}ms" if ping_time else "N/A (ARP)"
-                    
-                    # Advanced Classification
-                    dtype = self.classify_device(ip, mac, host, vendor, ports, shared, fingerprint)
-                    
-                    # FILTER: Only show devices with a MAC or if it's the gateway/local
-                    if mac != "Unknown" or "GATEWAY" in dtype.upper() or ip == self.detect_subnet().split('/')[0]:
-                        res_data = (ip, mac, host, vendor, dtype, res_display, ports, shared, fingerprint)
-                        self.all_scan_results.append(res_data)
-                        self.root.after(0, self._add_scan_result, res_data)
-                        results_found += 1
-                    found_ips.add(ip)
-                
-                scanned_count += 1
-                # Update progress bar and label
-                self.root.after(0, lambda c=scanned_count: self.update_scan_progress(c, total))
-                q.task_done()
+        subnet_ips = set(hosts)
 
-        for _ in range(min(max_threads, total)):
-            t = threading.Thread(target=worker, daemon=True)
-            t.start()
-            threads.append(t)
+        # Trigger ARP quickly by sending a tiny UDP packet to each IP.
+        # This is much faster than spawning ping processes and finds silent devices (if they answer ARP).
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setblocking(False)
+            payload = b"\x00"
+            for i, ip in enumerate(hosts, start=1):
+                if self.stop_event.is_set():
+                    break
+                try:
+                    s.sendto(payload, (ip, 1))
+                except Exception:
+                    pass
+                if i % 64 == 0:
+                    self.root.after(0, lambda c=i: self.update_scan_progress(c, total_hosts))
+            try:
+                s.close()
+            except Exception:
+                pass
+        except Exception:
+            pass
 
-        for t in threads: t.join()
-        
-        # ARP Sweep Cleanup (Find devices that didn't respond to ping but are in ARP table)
-        if not self.stop_event.is_set():
+        # Give neighbor/ARP tables a moment to populate
+        time.sleep(0.8)
+
+        discovered = {}  # ip -> {"mac": "...", "iface": "..."}
+
+        # Prefer structured neighbor table via PowerShell
+        def read_neighbors_powershell():
+            out_map = {}
+            if sys.platform != "win32":
+                return out_map
+            ps_cmd = (
+                "powershell -NoProfile -Command \""
+                "Get-NetNeighbor -AddressFamily IPv4 | "
+                "Where-Object { $_.IPAddress -and $_.LinkLayerAddress -and $_.LinkLayerAddress -ne '00-00-00-00-00-00' } | "
+                "Select-Object InterfaceAlias,IPAddress,LinkLayerAddress,State | ConvertTo-Json\""
+            )
+            proc = subprocess.run(ps_cmd, shell=True, capture_output=True, text=True)
+            if proc.returncode != 0 or not proc.stdout.strip():
+                return out_map
+            data = json.loads(proc.stdout)
+            rows = data if isinstance(data, list) else [data]
+            for r in rows:
+                ip = str(r.get("IPAddress", "")).strip()
+                mac = str(r.get("LinkLayerAddress", "")).strip().upper().replace("-", ":")
+                iface = str(r.get("InterfaceAlias", "")).strip()
+                if ip and mac and ip in subnet_ips:
+                    out_map[ip] = {"mac": mac, "iface": iface}
+            return out_map
+
+        # Fallback: arp -a parsing
+        if not discovered and not self.stop_event.is_set():
             try:
                 out = subprocess.check_output("arp -a", shell=True, text=True)
                 for line in out.splitlines():
-                    match = re.search(r"^\s*(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F]{2}[:-]){5}([0-9a-fA-F]{2})\s+(dynamic|static)", line, re.IGNORECASE)
-                    if match:
-                        arp_ip = match.group(1)
-                        mac = match.group(0).split()[1].upper().replace("-", ":")
-                        if arp_ip in subnet_ips and arp_ip not in found_ips:
-                            host = self.resolve_hostname(arp_ip)
-                            vendor = self.lookup_vendor(mac)
-                            ports = self.port_scan(arp_ip) if results_found < 50 else "-"
-                            if "445" in ports or "139" in ports:
-                                shared = self.get_smb_shares(arp_ip)
-                            else:
-                                shared = "❌" if ports != "-" else "?"
-                            
-                            dtype = self.classify_device(arp_ip, mac, host, vendor, ports, shared)
-                            
-                            # FILTER: Only show if MAC is known
-                            if mac != "Unknown":
-                                res_data = (arp_ip, mac, host, vendor, dtype, "N/A (ARP)", ports, shared, "")
-                                self.all_scan_results.append(res_data)
-                                self.root.after(0, self._add_scan_result, res_data)
-                                results_found += 1
-                            found_ips.add(arp_ip)
-            except: pass
+                    m = re.search(
+                        r"^\s*(\d+\.\d+\.\d+\.\d+)\s+(([0-9a-fA-F]{2}[:-]){5}([0-9a-fA-F]{2}))\s+(dynamic|static)",
+                        line,
+                        re.IGNORECASE,
+                    )
+                    if m:
+                        ip = m.group(1)
+                        mac = m.group(2).upper().replace("-", ":")
+                        if ip in subnet_ips:
+                            discovered[ip] = {"mac": mac, "iface": ""}
+            except Exception:
+                pass
+        else:
+            # If PowerShell worked, normalize discovered to dict shape
+            if isinstance(next(iter(discovered.values()), None), str):
+                discovered = {ip: {"mac": mac, "iface": ""} for ip, mac in discovered.items()}
+
+        # Multi-pass neighbor reading to catch ARP rate-limited entries
+        if sys.platform == "win32" and not self.stop_event.is_set():
+            try:
+                for _ in range(2):
+                    time.sleep(0.6)
+                    more = read_neighbors_powershell()
+                    for ip, data in more.items():
+                        discovered.setdefault(ip, data)
+            except Exception:
+                pass
+
+        # Always include THIS PC if it has an IP inside the scanned subnet.
+        local_ips = set()
+        if sys.platform == "win32" and not self.stop_event.is_set():
+            try:
+                ps_cmd = (
+                    "powershell -NoProfile -Command \""
+                    "Get-NetIPAddress -AddressFamily IPv4 | "
+                    "Where-Object { $_.IPAddress -and $_.IPAddress -ne '127.0.0.1' } | "
+                    "Select-Object InterfaceAlias,IPAddress | ConvertTo-Json\""
+                )
+                proc = subprocess.run(ps_cmd, shell=True, capture_output=True, text=True)
+                if proc.returncode == 0 and proc.stdout.strip():
+                    data = json.loads(proc.stdout)
+                    rows = data if isinstance(data, list) else [data]
+                    for r in rows:
+                        ip = str(r.get("IPAddress", "")).strip()
+                        iface = str(r.get("InterfaceAlias", "")).strip()
+                        if ip and ip in subnet_ips:
+                            local_ips.add(ip)
+                            discovered.setdefault(ip, {"mac": self.my_mac, "iface": iface})
+            except Exception:
+                pass
+
+        # -------------------------------
+        # Phase 2: Fingerprint targets
+        # -------------------------------
+        history_devices = {}
+        if os.path.exists(self.history_path):
+            try:
+                with open(self.history_path, 'r', encoding='utf-8') as f:
+                    past = json.load(f)
+                    for row in past:
+                        if isinstance(row, list) and len(row) >= 7:
+                            if row[0] in subnet_ips:
+                                history_devices[row[0]] = row
+            except Exception:
+                pass
+
+        all_target_ips = set(discovered.keys()).union(history_devices.keys())
+        targets = sorted(list(all_target_ips), key=lambda x: ipaddress.IPv4Address(x))
+        total = len(targets)
         
+        self.root.after(0, lambda: self.scan_progress.configure(maximum=max(total, 1), value=0))
+        self.root.after(0, lambda: self.scan_status_lbl.config(text=f"Fingerprinting {total}..."))
+
+        results_found = 0
+        scanned_count = 0
+        max_threads = 200 if total <= 512 else 260
+
+        def process_ip(ip):
+            if self.stop_event.is_set():
+                return None
+            mac = (discovered.get(ip) or {}).get("mac") or self.get_mac_from_arp(ip)
+            
+            is_offline = False
+            if mac == "Unknown" and ip in history_devices:
+                if self.ping_host(ip):
+                    mac = history_devices[ip][1]
+                else:
+                    is_offline = True
+            
+            if is_offline:
+                row = list(history_devices[ip])
+                row[4] = "❌ Offline"
+                return tuple(row)
+                
+            if mac and mac != "Unknown":
+                host = socket.gethostname() if ip in local_ips else self.resolve_hostname(ip)
+                vendor = self.lookup_vendor(mac)
+                ports = self.port_scan(ip)
+                
+                fingerprint = ""
+                snmp = self.snmp_probe(ip)
+                ssdp = self.ssdp_probe(ip)
+                if snmp: fingerprint += f"SNMP: {snmp} "
+                if ssdp:
+                    server_match = re.search(r"Server:\s*(.*)", ssdp, re.I)
+                    if server_match: fingerprint += f"SSDP: {server_match.group(1).strip()}"
+                
+                try:
+                    if hasattr(self, 'http_fingerprint'):
+                        http_hint = self.http_fingerprint(ip, ports)
+                        if http_hint:
+                            fingerprint = (fingerprint + " " + http_hint).strip()
+                except Exception:
+                    pass
+                
+                if "445" in ports or "139" in ports:
+                    shared = self.get_smb_shares(ip)
+                else:
+                    shared = "❌" if ports != "-" else "?"
+                    
+                res_display = "Online"
+                dtype = "🖥️ This PC" if ip in local_ips else self.classify_device(ip, mac, host, vendor, ports, shared, fingerprint)
+                
+                if mac != "Unknown" or "GATEWAY" in dtype.upper() or ip == self.detect_subnet().split('/')[0]:
+                    return (ip, mac, host, dtype, res_display, ports, shared)
+            return None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
+            future_to_ip = {executor.submit(process_ip, ip): ip for ip in targets}
+            for future in concurrent.futures.as_completed(future_to_ip):
+                if self.stop_event.is_set():
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+                try:
+                    res_data = future.result()
+                    if res_data:
+                        self.all_scan_results.append(res_data)
+                        self.root.after(0, self._add_scan_result, res_data)
+                        results_found += 1
+                except Exception:
+                    pass
+                scanned_count += 1
+                self.root.after(0, lambda c=scanned_count: self.update_scan_progress(c, total))
+
         self.scan_running = False
         self.root.after(0, self._finish_scan, results_found)
         self.save_scan_history()
@@ -795,18 +916,39 @@ class LANManagerApp:
         self.scan_status_lbl.config(text=f"Scanning: {current} / {total}")
 
     def filter_scanner_results(self):
-        """AI Smart Search logic to filter the treeview."""
+        """Fast search: debounced + background filter to avoid UI lag."""
         query = self.scan_search_entry.get().strip().lower()
-        
-        # Clear tree
-        for item in self.scanner_tree.get_children():
-            self.scanner_tree.delete(item)
-            
-        # Refill based on query
-        for data in self.all_scan_results:
-            # Smart match: check if query is in ANY of the data fields
-            if any(query in str(field).lower() for field in data):
-                self.scanner_tree.insert("", tk.END, values=data)
+        if getattr(self, "_scan_filter_job", None) is not None:
+            try:
+                self.root.after_cancel(self._scan_filter_job)
+            except Exception:
+                pass
+        self._scan_filter_job = self.root.after(150, lambda q=query: self._run_scan_filter(q))
+
+    def _run_scan_filter(self, query: str):
+        self._scan_filter_job = None
+        self._scan_filter_token = getattr(self, "_scan_filter_token", 0) + 1
+        token = self._scan_filter_token
+        data_snapshot = list(self.all_scan_results)
+
+        def worker():
+            if not query:
+                filtered = data_snapshot
+            else:
+                filtered = [row for row in data_snapshot if any(query in str(f).lower() for f in row)]
+
+            def apply():
+                if token != self._scan_filter_token:
+                    return
+                for item in self.scanner_tree.get_children():
+                    self.scanner_tree.delete(item)
+                for row in filtered:
+                    self.scanner_tree.insert("", tk.END, values=row)
+                self.found_lbl.config(text=f"{len(filtered)} devices shown")
+
+            self.root.after(0, apply)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _add_scan_result(self, data):
         self.scanner_tree.insert("", tk.END, values=data)
@@ -931,15 +1073,117 @@ class LANManagerApp:
             
         return "❓ Generic Device"
 
-    def resolve_hostname(self, ip):
+    def _local_host_aliases(self):
+        aliases = set()
         try:
-            # Try basic lookup
-            name = socket.getfqdn(ip)
-            if name and name != ip:
+            hn = socket.gethostname().strip()
+            if hn:
+                aliases.add(hn.lower())
+                aliases.add(hn.split(".")[0].lower())
+        except Exception:
+            pass
+        try:
+            fq = socket.getfqdn().strip()
+            if fq:
+                aliases.add(fq.lower())
+                aliases.add(fq.split(".")[0].lower())
+        except Exception:
+            pass
+        for env_var in ["COMPUTERNAME", "USERDOMAIN"]:
+            val = os.environ.get(env_var)
+            if val:
+                aliases.add(val.lower())
+        aliases.add("localhost")
+        return {a for a in aliases if a}
+
+    def _netbios_name_from_nbtstat(self, ip: str) -> str:
+        if sys.platform != "win32":
+            return ""
+        try:
+            proc = subprocess.run(f"nbtstat -A {ip}", shell=True, capture_output=True, text=True, timeout=1.5)
+            out = (proc.stdout or "") + (proc.stderr or "")
+            candidates = []
+            for line in out.splitlines():
+                if "<00>" not in line:
+                    continue
+                if "GROUP" in line.upper() or "INTERNET GROUP" in line.upper():
+                    continue
+                parts = line.strip().split()
+                if not parts:
+                    continue
+                name = parts[0].strip()
+                if name:
+                    candidates.append(name)
+            for c in candidates:
+                if c.upper() not in ("WORKGROUP", "MSHOME", "HOME"):
+                    return c
+            return candidates[0] if candidates else ""
+        except Exception:
+            return ""
+
+    def _ptr_name_via_powershell(self, ip: str) -> str:
+        if sys.platform != "win32":
+            return ""
+        try:
+            a, b, c, d = str(ip).strip().split(".")
+            arpa = f"{d}.{c}.{b}.{a}.in-addr.arpa"
+            ps = (
+                "powershell -NoProfile -Command "
+                f"\"try {{ (Resolve-DnsName -Name '{arpa}' -Type PTR -Server 224.0.0.251 -DnsOnly -ErrorAction Stop "
+                f"| Select-Object -First 1 -ExpandProperty NameHost) }} catch {{ '' }}\""
+            )
+            proc = subprocess.run(ps, shell=True, capture_output=True, text=True, timeout=2)
+            name = (proc.stdout or "").strip()
+            if name and name.lower() != str(ip).lower():
                 return name
-            # Fallback to gethostbyaddr
-            return socket.gethostbyaddr(ip)[0]
-        except: return "Unknown"
+        except Exception:
+            pass
+        return ""
+
+    def resolve_hostname(self, ip):
+        local_aliases = self._local_host_aliases()
+
+        def norm(n: str) -> str:
+            n = (n or "").strip()
+            if not n:
+                return ""
+            return n.rstrip(".").lower()
+
+        candidates = []
+        try:
+            fq = socket.getfqdn(ip)
+            if fq and fq != ip and norm(fq) not in local_aliases and norm(fq).split(".")[0] not in local_aliases:
+                candidates.append(fq)
+        except Exception:
+            pass
+        try:
+            rev = socket.gethostbyaddr(ip)[0]
+            if rev and norm(rev) not in local_aliases and norm(rev).split(".")[0] not in local_aliases:
+                candidates.append(rev)
+        except Exception:
+            pass
+
+        for c in candidates:
+            cn = norm(c)
+            base = cn.split(".")[0]
+            if not cn or cn == norm(ip):
+                continue
+            if cn in local_aliases or base in local_aliases:
+                continue
+            return c
+
+        nb = self._netbios_name_from_nbtstat(ip)
+        if nb:
+            return nb
+
+        ptr = self._ptr_name_via_powershell(ip)
+        if ptr:
+            cn = norm(ptr)
+            base = cn.split(".")[0]
+            if cn not in local_aliases and base not in local_aliases:
+                return ptr
+
+        return "Unknown"
 
     def lookup_vendor(self, mac):
         if not mac or mac == "Unknown": return "Unknown"
@@ -980,9 +1224,7 @@ class LANManagerApp:
         for item in self.scanner_tree.get_children():
             ip = self.scanner_tree.item(item)['values'][0]
             mac = self.get_mac_from_arp(ip)
-            vendor = self.lookup_vendor(mac)
             self.scanner_tree.set(item, column="MAC Address", value=mac)
-            self.scanner_tree.set(item, column="Vendor", value=vendor)
 
     def export_scan_results(self):
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -993,7 +1235,7 @@ class LANManagerApp:
             # Export CSV
             with open(csv_filename, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                header = ["IP", "MAC", "Hostname", "Vendor", "Device Type", "Response", "Ports", "Shared", "Fingerprint"]
+                header = ["IP", "MAC", "Hostname", "Device Type", "Response", "Ports", "Shared"]
                 writer.writerow(header)
                 for data in self.all_scan_results:
                     writer.writerow(data)
@@ -1002,9 +1244,9 @@ class LANManagerApp:
             json_data = []
             for data in self.all_scan_results:
                 json_data.append({
-                    "ip": data[0], "mac": data[1], "hostname": data[2], 
-                    "vendor": data[3], "role": data[4], "latency": data[5],
-                    "ports": data[6], "shares": data[7], "fingerprint": data[8],
+                    "ip": data[0], "mac": data[1], "hostname": data[2],
+                    "role": data[3], "latency": data[4],
+                    "ports": data[5], "shares": data[6],
                     "timestamp": datetime.now().isoformat()
                 })
             with open(json_filename, 'w', encoding='utf-8') as f:
@@ -1025,8 +1267,19 @@ class LANManagerApp:
             try:
                 with open(self.history_path, 'r', encoding='utf-8') as f:
                     self.all_scan_results = json.load(f)
+                cleaned = []
                 for data in self.all_scan_results:
+                    if not isinstance(data, list):
+                        continue
+                    # Previous formats:
+                    # - 9 fields: (ip, mac, host, vendor, dtype, resp, ports, shared, fingerprint)
+                    # - 10 fields: (ip, mac, host, vendor, dtype, resp, ports, shared, fingerprint, adapter)
+                    # New format (7 fields): (ip, mac, host, dtype, resp, ports, shared)
+                    if len(data) >= 8:
+                        data = [data[0], data[1], data[2], data[4], data[5], data[6], data[7]]
+                    cleaned.append(data)
                     self.scanner_tree.insert("", tk.END, values=data)
+                self.all_scan_results = cleaned
                 self.found_lbl.config(text=f"{len(self.all_scan_results)} devices loaded from history")
                 self.scan_status_lbl.config(text="History Loaded")
             except: pass
